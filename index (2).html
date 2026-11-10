@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Third-Person Movement Demo</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#87b7e8;font-family:system-ui,sans-serif}
+canvas{display:block}
+#hud{position:fixed;left:14px;bottom:14px;color:#fff;background:rgba(10,20,40,.55);padding:10px 14px;border-radius:10px;font-size:13px;line-height:1.7;pointer-events:none}
+#hud b{color:#ffd54a}
+#state{position:fixed;top:14px;left:16px;color:#fff;font-weight:800;font-size:20px;letter-spacing:.05em;text-transform:uppercase;text-shadow:0 2px 6px #0007;pointer-events:none}
+#prompt{position:fixed;left:50%;bottom:18%;transform:translateX(-50%);color:#fff;text-align:center;font-weight:700;text-shadow:0 2px 6px #000a;display:none;pointer-events:none}
+#barwrap{width:160px;height:8px;background:#0006;border-radius:4px;margin:8px auto 0;overflow:hidden}
+#bar{height:100%;width:0;background:#ffd54a}
+#start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,20,40,.55);color:#fff;font-size:22px;font-weight:700;cursor:pointer}
+</style>
+</head>
+<body>
+<div id="state">idle</div>
+<div id="prompt"><div>Hold <span style="color:#ffd54a">E</span> to open chest</div><div id="barwrap"><div id="bar"></div></div></div>
+<div id="hud">
+<b>WASD</b> move &nbsp; <b>Mouse</b> look<br>
+<b>Shift</b> sprint &nbsp; <b>Z</b> walk &nbsp; <b>Space</b> jump<br>
+<b>C</b> crouch &nbsp; <b>C while sprinting</b> slide<br>
+<b>Hold E</b> open chest &nbsp; <b>Esc</b> release mouse
+</div>
+<div id="start">Click to play</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- Tuning (units: metres, seconds) ----------
+const TUNING = {
+  walk: 3.0, run: 6.2, sprint: 9.0, crouch: 2.6,
+  slideStart: 11.5, slideFriction: 8.5, slideMinSpeed: 3.4, slideMinEntry: 6.5,
+  jump: 7.6, gravity: 24, groundAccel: 16, airAccel: 3.2,
+  chestTime: 1.1, chestRange: 2.3, camDist: 3.6, camShoulder: 0.7, sens: 0.0022
+};
+
+// ---------- Renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87b7e8);
+scene.fog = new THREE.Fog(0x87b7e8, 40, 140);
+const cam = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 300);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x4a7a3a, 0.85));
+const sun = new THREE.DirectionalLight(0xfff2d0, 0.9);
+sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, {left:-30, right:30, top:30, bottom:-30, far:120});
+scene.add(sun, sun.target);
+
+const M = c => new THREE.MeshStandardMaterial({color:c, roughness:.7});
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(400,400), M(0x5aa84a));
+ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
+const grid = new THREE.GridHelper(400, 200, 0x4f9a40, 0x4f9a40); grid.position.y = .01; scene.add(grid);
+
+// ---------- Collision circles (trees, chests) ----------
+const colliders = [];
+let seed = 7; const rnd = () => (seed = (seed*16807) % 2147483647) / 2147483647;
+for (let i = 0; i < 34; i++) {
+  const a = rnd()*Math.PI*2, r = 12 + rnd()*45, x = Math.cos(a)*r, z = Math.sin(a)*r;
+  const t = new THREE.Group(), h = 2 + rnd()*2;
+  const trunk = new THREE.Mesh(new THREE.CylinderGeometry(.25,.32,h,8), M(0x6b4a2b)); trunk.position.y = h/2;
+  const top = new THREE.Mesh(new THREE.ConeGeometry(1.5, 3.2, 8), M(0x2f7a3a)); top.position.y = h + 1.1;
+  trunk.castShadow = top.castShadow = true; t.add(trunk, top); t.position.set(x,0,z); scene.add(t);
+  colliders.push({x, z, r:.5});
+}
+
+// ---------- Chests ----------
+const chests = [];
+function makeChest(x, z, ry) {
+  const g = new THREE.Group();
+  const gold = new THREE.MeshStandardMaterial({color:0xf2b632, metalness:.6, roughness:.35, emissive:0x553300, emissiveIntensity:.5});
+  const base = new THREE.Mesh(new THREE.BoxGeometry(.9,.5,.6), M(0x7a4a22)); base.position.y = .25;
+  const band = new THREE.Mesh(new THREE.BoxGeometry(.94,.1,.64), gold); band.position.y = .3;
+  const lidPivot = new THREE.Group(); lidPivot.position.set(0,.5,-.3);
+  const lidGeo = new THREE.BoxGeometry(.9,.28,.6); lidGeo.translate(0,.14,.3);
+  const lid = new THREE.Mesh(lidGeo, M(0x8a5628));
+  const lidBand = new THREE.Mesh(new THREE.BoxGeometry(.94,.06,.64), gold); lidBand.position.set(0,.04,.3);
+  const lock = new THREE.Mesh(new THREE.BoxGeometry(.14,.18,.06), gold); lock.position.set(0,.45,.32);
+  lidPivot.add(lid, lidBand); g.add(base, band, lidPivot, lock);
+  g.traverse(o => o.castShadow = true);
+  const light = new THREE.PointLight(0xffc040, 1.6, 6); light.position.y = .9; g.add(light);
+  const beam = new THREE.Mesh(new THREE.CylinderGeometry(.3,.3,7,12,1,true),
+    new THREE.MeshBasicMaterial({color:0xffc040, transparent:true, opacity:.14, blending:THREE.AdditiveBlending, depthWrite:false}));
+  beam.position.y = 3.5; g.add(beam);
+  g.position.set(x,0,z); g.rotation.y = ry; scene.add(g);
+  const c = {g, lidPivot, light, beam, x, z, open:0, opened:false};
+  chests.push(c); colliders.push({x, z, r:.65});
+}
+[[0,14],[-11,10],[12,7],[-7,-12],[16,-9],[4,-18]].forEach(([x,z]) => makeChest(x, z, Math.atan2(-x, 8-z)));
+
+// Loot popped from chests
+const loot = [];
+const RARITY = [0x9aa0a6, 0x4cc24c, 0x3d8bff, 0xa855f7, 0xffb020];
+function spawnLoot(c) {
+  for (let i = 0; i < 3; i++) {
+    const col = RARITY[Math.min(4, Math.floor(Math.pow(Math.random(), 1.6)*5))];
+    const m = new THREE.Mesh(new THREE.OctahedronGeometry(.2),
+      new THREE.MeshStandardMaterial({color:col, emissive:col, emissiveIntensity:.8}));
+    m.position.set(c.x, .6, c.z);
+    scene.add(m);
+    const a = (i/3)*Math.PI*2 + Math.random();
+    loot.push({m, vx:Math.cos(a)*1.6, vz:Math.sin(a)*1.6, vy:5, life:7, rest:false});
+  }
+}
+
+// ---------- Character rig (original design, procedural) ----------
+const hero = new THREE.Group(); scene.add(hero);
+const body = new THREE.Group(); hero.add(body);
+const hips = new THREE.Group(); hips.position.y = .95; body.add(hips);
+const torso = new THREE.Group(); hips.add(torso);
+const cShirt = M(0x2d6cdf), cPants = M(0x2b2f3a), cSkin = M(0xe0ac84), cHelm = M(0xe8553d), cAcc = M(0xffd54a);
+function box(w,h,d,mat,x,y,z,parent,pivotTop) {
+  const g = new THREE.BoxGeometry(w,h,d); if (pivotTop) g.translate(0,-h/2,0);
+  const m = new THREE.Mesh(g, mat); m.position.set(x,y,z); m.castShadow = true; parent.add(m); return m;
+}
+box(.5,.6,.28,cShirt,0,.3,0,torso);
+box(.52,.12,.3,cAcc,0,.08,0,torso);          // belt
+box(.34,.42,.14,M(0x444b5c),0,.32,-.21,torso); // backpack
+const head = new THREE.Group(); head.position.y = .72; torso.add(head);
+box(.3,.3,.3,cSkin,0,.15,0,head);
+box(.34,.16,.34,cHelm,0,.34,0,head);          // helmet top
+box(.3,.1,.1,M(0x111820),0,.2,.15,head);      // visor
+function makeArm(side) {
+  const sh = new THREE.Group(); sh.position.set(side*.33,.55,0); torso.add(sh);
+  box(.14,.3,.14,cShirt,0,0,0,sh,true);
+  const el = new THREE.Group(); el.position.y = -.3; sh.add(el);
+  box(.12,.28,.12,cSkin,0,0,0,el,true);
+  box(.14,.12,.14,cAcc,0,-.3,0,el);            // glove
+  return {sh, el};
+}
+function makeLeg(side) {
+  const hp = new THREE.Group(); hp.position.set(side*.14,0,0); hips.add(hp);
+  box(.18,.45,.18,cPants,0,0,0,hp,true);
+  const kn = new THREE.Group(); kn.position.y = -.45; hp.add(kn);
+  box(.16,.4,.16,cPants,0,0,0,kn,true);
+  box(.18,.1,.28,M(0x1b1b1b),0,-.42,.04,kn);   // boot
+  return {hp, kn};
+}
+const armL = makeArm(1), armR = makeArm(-1), legL = makeLeg(1), legR = makeLeg(-1);
+
+// ---------- Input ----------
+const keys = {}; let jumpP = false, crouchP = false, locked = false, camYaw = 0, camPitch = .25;
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (!e.repeat) { if (e.code === 'Space') jumpP = true; if (e.code === 'KeyC') crouchP = true; }
+  if (e.code === 'Space') e.preventDefault();
+});
+addEventListener('keyup', e => keys[e.code] = false);
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+const startEl = document.getElementById('start');
+startEl.addEventListener('click', () => renderer.domElement.requestPointerLock());
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  startEl.style.display = locked ? 'none' : 'flex';
+});
+addEventListener('mousemove', e => {
+  if (!locked) return;
+  camYaw -= e.movementX * TUNING.sens;
+  camPitch = Math.max(-.35, Math.min(1.1, camPitch + e.movementY * TUNING.sens));
+});
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight); cam.aspect = innerWidth/innerHeight; cam.updateProjectionMatrix();
+});
+
+// ---------- Player state ----------
+const P = {pos:new THREE.Vector3(0,0,6), vel:new THREE.Vector3(), face:0, grounded:true,
+  crouch:false, sliding:false, slideSpd:0, slideDir:new THREE.Vector2(), ph:0, chest:null, prog:0, state:'idle'};
+const pose = {hipY:.95, pitch:0, lean:0, tL:0, tR:0, kL:0, kR:0, aL:0, aR:0, eL:0, eR:0, armZ:0};
+const lerpAng = (a,b,t) => a + ((((b-a+Math.PI)%(Math.PI*2))+Math.PI*2)%(Math.PI*2) - Math.PI) * t;
+const stateEl = document.getElementById('state'), promptEl = document.getElementById('prompt'), barEl = document.getElementById('bar');
+let fov = 70, time = 0;
+
+function endSlide() { P.sliding = false; P.crouch = !!keys.KeyC; }
+
+function update(dt) {
+  time += dt;
+  const T = TUNING;
+  // input -> world direction relative to camera
+  const ix = (keys.KeyD?1:0) - (keys.KeyA?1:0), iz = (keys.KeyW?1:0) - (keys.KeyS?1:0);
+  const fx = Math.sin(camYaw), fz = Math.cos(camYaw), rx = -fz, rz = fx;
+  let dx = fx*iz + rx*ix, dz = fz*iz + rz*ix; const len = Math.hypot(dx,dz);
+  if (len > 0) { dx /= len; dz /= len; }
+  const moving = len > 0;
+
+  // chest interaction
+  let near = null, nd = T.chestRange;
+  for (const c of chests) if (!c.opened) { const d = Math.hypot(c.x-P.pos.x, c.z-P.pos.z); if (d < nd) { nd = d; near = c; } }
+  const opening = !!(near && keys.KeyE && P.grounded && !P.sliding);
+  if (opening) { P.chest = near; P.prog += dt / T.chestTime;
+    if (P.prog >= 1) { near.opened = true; spawnLoot(near); P.prog = 0; P.chest = null; } }
+  else { P.prog = Math.max(0, P.prog - dt*3); if (P.prog === 0) P.chest = null; }
+  const busy = opening && !near?.opened;
+
+  // sprint / crouch / slide
+  const sprint = !busy && !P.sliding && (keys.ShiftLeft || keys.ShiftRight) && iz > 0 && moving;
+  const hSpd = Math.hypot(P.vel.x, P.vel.z);
+  if (crouchP && !P.sliding) {
+    if (P.grounded && hSpd > T.slideMinEntry && (sprint || hSpd > T.run + 0.5)) {
+      P.sliding = true; P.crouch = true; P.slideSpd = Math.max(T.slideStart, hSpd * 1.1);
+      P.slideDir.set(P.vel.x/hSpd, P.vel.z/hSpd);
+    }
+  }
+  if (!P.sliding) {
+    if (keys.KeyC) P.crouch = true;
+    else if (P.crouch) P.crouch = false;
+  }
+  if (sprint && P.crouch) P.crouch = false;
+  crouchP = false;
+
+  // jump
+  if (jumpP && P.grounded && !busy) { P.vel.y = T.jump; P.grounded = false; if (P.sliding) endSlide(); }
+  jumpP = false;
+
+  // horizontal velocity
+  if (P.sliding) {
+    P.slideSpd -= T.slideFriction * dt;
+    if (P.slideSpd < T.slideMinSpeed || !P.grounded) endSlide();
+    else { P.vel.x = P.slideDir.x * P.slideSpd; P.vel.z = P.slideDir.y * P.slideSpd; }
+  } else {
+    let tgt = 0;
+    if (!busy && moving) tgt = P.crouch ? T.crouch : keys.KeyZ ? T.walk : sprint ? T.sprint : T.run;
+    const a = 1 - Math.exp(-(P.grounded ? T.groundAccel : T.airAccel) * dt);
+    P.vel.x += (dx*tgt - P.vel.x) * a; P.vel.z += (dz*tgt - P.vel.z) * a;
+  }
+  // gravity + move
+  P.vel.y -= T.gravity * dt;
+  P.pos.addScaledVector(P.vel, dt);
+  if (P.pos.y <= 0) { P.pos.y = 0; P.vel.y = 0; P.grounded = true; } else P.grounded = false;
+  for (const c of colliders) {
+    const ox = P.pos.x - c.x, oz = P.pos.z - c.z, d = Math.hypot(ox, oz), m = c.r + .4;
+    if (d < m && d > 0.001) { P.pos.x = c.x + ox/d*m; P.pos.z = c.z + oz/d*m; if (P.sliding) endSlide(); }
+  }
+
+  // facing: sprint/slide/air face travel direction, otherwise face the camera (like a shooter)
+  let ft = camYaw;
+  const hs = Math.hypot(P.vel.x, P.vel.z);
+  if (P.sliding) ft = Math.atan2(P.slideDir.x, P.slideDir.y);
+  else if ((sprint || (!P.grounded && hs > 4)) && hs > .5) ft = Math.atan2(P.vel.x, P.vel.z);
+  if (busy && P.chest) ft = Math.atan2(P.chest.x - P.pos.x, P.chest.z - P.pos.z);
+  P.face = lerpAng(P.face, ft, 1 - Math.exp(-14*dt));
+
+  // state
+  let s;
+  if (busy) s = 'chest';
+  else if (P.sliding) s = 'slide';
+  else if (!P.grounded) s = P.vel.y > 0 ? 'jump' : 'fall';
+  else if (P.crouch) s = hs > .5 ? 'crouchwalk' : 'crouch';
+  else if (hs < .3) s = 'idle';
+  else if (sprint) s = 'sprint';
+  else if (keys.KeyZ) s = 'walk';
+  else s = 'run';
+  P.state = s;
+
+  // gait phase (sign from local forward velocity so backpedalling reverses the cycle)
+  const lf = P.vel.x*Math.sin(P.face) + P.vel.z*Math.cos(P.face);
+  const rate = { walk:1.7, run:1.5, sprint:1.35, crouchwalk:1.9 }[s];
+  if (rate && P.grounded) P.ph += dt * hs * rate * (lf >= -.2 ? 1 : -1);
+  const ph = P.ph, sn = Math.sin(ph), sn2 = Math.sin(ph+Math.PI);
+  const T0 = {hipY:.95, pitch:0, lean:.03+Math.sin(time*2)*.01, tL:0, tR:0, kL:0, kR:0, aL:.05, aR:.05, eL:-.15, eR:-.15, armZ:.06};
+  const gait = (amp, knee, arm, elbow, lean, bob, hipBase = .95) => {
+    T0.tL = sn*amp; T0.tR = sn2*amp;
+    T0.kL = Math.max(0,-Math.cos(ph))*knee + .1; T0.kR = Math.max(0,-Math.cos(ph+Math.PI))*knee + .1;
+    T0.aL = -sn*arm; T0.aR = -sn2*arm; T0.eL = T0.eR = -elbow; T0.lean = lean;
+    T0.hipY = hipBase - Math.abs(Math.cos(ph))*bob;
+  };
+  if (s === 'walk') gait(.5, .6, .4, .25, .05, .03);
+  else if (s === 'run') gait(.85, 1.3, .8, .9, .18, .05);
+  else if (s === 'sprint') gait(1.05, 1.7, 1.0, 1.4, .38, .06);
+  else if (s === 'crouch') Object.assign(T0, {hipY:.6, lean:.4, tL:-1.15, tR:-1.15, kL:1.75, kR:1.75, aL:-.5, aR:-.5, eL:-.9, eR:-.9});
+  else if (s === 'crouchwalk') { gait(.4, .5, .3, .5, .4, .02, .6); T0.tL -= 1.1; T0.tR -= 1.1; T0.kL += 1.6; T0.kR += 1.6; T0.aL -= .4; T0.aR -= .4; }
+  else if (s === 'slide') Object.assign(T0, {hipY:.42, pitch:-1.05, lean:.75, tL:-.15, tR:-.35, kL:.15, kR:.35, aL:.6, aR:.35, eL:-.4, eR:-.4, armZ:.5});
+  else if (s === 'jump') Object.assign(T0, {hipY:.95, lean:.1, tL:-.7, tR:.35, kL:1.2, kR:.8, aL:-1.5, aR:-1.2, eL:-.5, eR:-.4, armZ:.3});
+  else if (s === 'fall') Object.assign(T0, {hipY:.95, lean:.05, tL:-.3, tR:.25, kL:.5, kR:.3, aL:-.4, aR:-.4, eL:-.3, eR:-.3, armZ:1.0});
+  else if (s === 'chest') { const w = Math.sin(time*14)*.1;
+    Object.assign(T0, {hipY:.78, lean:.55, tL:-.45, tR:-.45, kL:.9, kR:.9, aL:-1.2+w, aR:-1.2-w, eL:-.4, eR:-.4}); }
+  const k = 1 - Math.exp(-(s==='run'||s==='sprint'||s==='walk' ? 26 : 14) * dt);
+  for (const key in pose) pose[key] += (T0[key] - pose[key]) * k;
+
+  // apply pose
+  hero.position.copy(P.pos); body.rotation.y = P.face;
+  hips.position.y = pose.hipY; hips.rotation.x = pose.pitch; torso.rotation.x = pose.lean;
+  legL.hp.rotation.x = pose.tL; legR.hp.rotation.x = pose.tR; legL.kn.rotation.x = pose.kL; legR.kn.rotation.x = pose.kR;
+  armL.sh.rotation.x = pose.aL; armR.sh.rotation.x = pose.aR; armL.el.rotation.x = pose.eL; armR.el.rotation.x = pose.eR;
+  armL.sh.rotation.z = pose.armZ; armR.sh.rotation.z = -pose.armZ;
+
+  // chest + loot animation
+  for (const c of chests) {
+    const tgt = c.opened ? 1.9 : (c === P.chest ? P.prog*.5 : 0);
+    c.lidPivot.rotation.x += (-tgt - c.lidPivot.rotation.x) * (1 - Math.exp(-10*dt));
+    c.beam.visible = !c.opened; c.light.intensity += ((c.opened ? .8 : 1.6) - c.light.intensity) * .1;
+  }
+  for (let i = loot.length-1; i >= 0; i--) {
+    const l = loot[i]; l.life -= dt;
+    if (!l.rest) { l.vy -= 14*dt; l.m.position.x += l.vx*dt; l.m.position.z += l.vz*dt; l.m.position.y += l.vy*dt;
+      if (l.m.position.y < .5) { l.m.position.y = .5; l.rest = true; } }
+    else l.m.position.y = .5 + Math.sin(time*3 + i)*.08;
+    l.m.rotation.y += dt*2.5;
+    l.m.scale.setScalar(Math.max(.01, Math.min(1, l.life)));
+    if (l.life <= 0) { scene.remove(l.m); loot.splice(i,1); }
+  }
+
+  // HUD
+  stateEl.textContent = s;
+  const showPrompt = near && !near.opened;
+  promptEl.style.display = showPrompt ? 'block' : 'none'; barEl.style.width = (P.prog*100) + '%';
+
+  // camera (over-the-shoulder, dips on crouch/slide, FOV kick on sprint/slide)
+  const targetFov = s === 'slide' ? 82 : s === 'sprint' ? 78 : 70;
+  fov += (targetFov - fov) * (1 - Math.exp(-6*dt)); cam.fov = fov; cam.updateProjectionMatrix();
+  const ch = pose.hipY + .75;
+  const look = new THREE.Vector3(Math.sin(camYaw)*Math.cos(camPitch), -Math.sin(camPitch), Math.cos(camYaw)*Math.cos(camPitch));
+  const tgt = new THREE.Vector3(P.pos.x + rx*TUNING.camShoulder, P.pos.y + ch, P.pos.z + rz*TUNING.camShoulder);
+  cam.position.copy(tgt).addScaledVector(look, -TUNING.camDist);
+  cam.position.y = Math.max(.3, cam.position.y);
+  cam.lookAt(tgt.x + look.x*5, tgt.y + look.y*5, tgt.z + look.z*5);
+
+  sun.position.set(P.pos.x + 20, 40, P.pos.z + 10); sun.target.position.copy(P.pos);
+}
+
+let last = performance.now();
+(function loop(now) {
+  const dt = Math.min(.05, (now - last)/1000); last = now;
+  update(dt); renderer.render(scene, cam); requestAnimationFrame(loop);
+})(last);
+</script>
+</body>
+</html>
