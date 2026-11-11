@@ -13,7 +13,13 @@ canvas{display:block}
 #prompt{position:fixed;left:50%;bottom:18%;transform:translateX(-50%);color:#fff;text-align:center;font-weight:700;text-shadow:0 2px 6px #000a;display:none;pointer-events:none}
 #barwrap{width:160px;height:8px;background:#0006;border-radius:4px;margin:8px auto 0;overflow:hidden}
 #bar{height:100%;width:0;background:#ffd54a}
-#start{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(10,20,40,.55);color:#fff;font-size:22px;font-weight:700;cursor:pointer}
+#start{position:fixed;inset:0;display:none;z-index:5;align-items:center;justify-content:center;background:rgba(10,20,40,.55);color:#fff;font-size:22px;font-weight:700;cursor:pointer}
+#select{position:fixed;inset:0;z-index:6;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(#1b2a4a,#3b5b8f);color:#fff}
+#select h1{margin:0 0 6px;font-size:30px}#select p{margin:0 0 24px;opacity:.8}
+#cards{display:flex;gap:16px;flex-wrap:wrap;justify-content:center}
+.card{width:150px;padding:18px 10px;border-radius:14px;background:rgba(255,255,255,.1);text-align:center;cursor:pointer;transition:.15s;border:2px solid transparent}
+.card:hover{transform:translateY(-6px);background:rgba(255,255,255,.2);border-color:#ffd54a}
+.card .sw{width:64px;height:64px;border-radius:50%;margin:0 auto 10px}.card span{display:block;opacity:.7;font-size:13px}
 </style>
 </head>
 <body>
@@ -23,11 +29,14 @@ canvas{display:block}
 <b>WASD</b> move &nbsp; <b>Mouse</b> look<br>
 <b>Shift</b> sprint &nbsp; <b>Z</b> walk &nbsp; <b>Space</b> jump<br>
 <b>C</b> crouch &nbsp; <b>C while sprinting</b> slide<br>
+<b>Space near a wall</b> mantle<br>
 <b>Hold E</b> open chest &nbsp; <b>Esc</b> release mouse
 </div>
-<div id="start">Click to play</div>
+<div id="start">Paused - click to resume</div>
+<div id="select"><h1>Choose your avatar</h1><p>Pick a character to start</p><div id="cards"></div></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
 <script>
 // ---------- Tuning (units: metres, seconds) ----------
 const TUNING = {
@@ -94,6 +103,26 @@ function makeChest(x, z, ry) {
 }
 [[0,14],[-11,10],[12,7],[-7,-12],[16,-9],[4,-18]].forEach(([x,z]) => makeChest(x, z, Math.atan2(-x, 8-z)));
 
+// Climbable crates / walls (AABB). h = top height.
+const boxes = [];
+[[6,5,1.2,1.2,1.4,0xb5835a],[-6,8,2.2,.4,2.0,0x8d99ae],[-3,-5,1,1,1.8,0xc08552],[10,-4,1.5,.5,2.3,0x6c757d],[-14,0,1,2,1.5,0xa68a64]].forEach(([x,z,hx,hz,h,c]) => {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(hx*2,h,hz*2), M(c)); m.position.set(x,h/2,z);
+  m.castShadow = m.receiveShadow = true; scene.add(m); boxes.push({x,z,hx,hz,h});
+});
+function groundAt(p) {
+  let g = 0;
+  for (const b of boxes) if (Math.abs(p.x-b.x) < b.hx+.2 && Math.abs(p.z-b.z) < b.hz+.2 && p.y >= b.h-.35) g = Math.max(g, b.h);
+  return g;
+}
+function findMantle() {
+  const fx = Math.sin(P.face), fz = Math.cos(P.face), px = P.pos.x + fx*.7, pz = P.pos.z + fz*.7;
+  for (const b of boxes) if (Math.abs(px-b.x) < b.hx+.1 && Math.abs(pz-b.z) < b.hz+.1) {
+    const rise = b.h - P.pos.y;
+    if (rise > .5 && rise < 2.4) return {b, fx, fz};
+  }
+  return null;
+}
+
 // Loot popped from chests
 const loot = [];
 const RARITY = [0x9aa0a6, 0x4cc24c, 0x3d8bff, 0xa855f7, 0xffb020];
@@ -153,11 +182,57 @@ addEventListener('keydown', e => {
 });
 addEventListener('keyup', e => keys[e.code] = false);
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+// ---------- Avatars: GLB from ./models/ (CC0), falls back to built-in rig ----------
+const AVATARS = [
+  {name:'Jax',    tag:'Male',   file:'models/male1.glb',   shirt:0x2d6cdf, pants:0x2b2f3a, helm:0xe8553d, skin:0xe0ac84},
+  {name:'Marcus', tag:'Male',   file:'models/male2.glb',   shirt:0x2f9e44, pants:0x3a3a3a, helm:0x222222, skin:0x8d5a3b},
+  {name:'Aria',   tag:'Female', file:'models/female1.glb', shirt:0xd6336c, pants:0x343a40, helm:0xf2c14e, skin:0xf1c9a5},
+  {name:'Zoe',    tag:'Female', file:'models/female2.glb', shirt:0x7048e8, pants:0x1c1c28, helm:0x5c3a21, skin:0xc68642}
+];
+let started = false, mixer = null, clips = [], curAct = null, avatarModel = null;
+const modelRoot = new THREE.Group(); body.add(modelRoot);
+function setAvatar(a) {
+  cShirt.color.set(a.shirt); cPants.color.set(a.pants); cHelm.color.set(a.helm); cSkin.color.set(a.skin);
+  modelRoot.clear(); avatarModel = null; mixer = null; curAct = null; hips.visible = true;
+  new THREE.GLTFLoader().load(a.file, g => {
+    const m = g.scene, bb = new THREE.Box3().setFromObject(m), sc = 1.8 / (bb.max.y - bb.min.y);
+    m.scale.setScalar(sc); m.position.y = -bb.min.y * sc;
+    m.traverse(o => { if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; } });
+    modelRoot.add(m); avatarModel = m; hips.visible = false;
+    mixer = new THREE.AnimationMixer(m); clips = g.animations;
+  }, undefined, () => console.warn('Model not found, using built-in character:', a.file));
+}
+const ANIM = {idle:[/idle/i], walk:[/walk/i,/run/i], run:[/^(?!.*(jump|slide)).*run/i,/jog/i,/walk/i], sprint:[/sprint/i,/run/i],
+  jump:[/jump/i], fall:[/fall/i,/jump/i], crouch:[/crouch.*idle/i,/crouch/i,/idle/i], crouchwalk:[/crouch.*(walk|fwd)/i,/crouch/i,/walk/i],
+  slide:[/slide/i], chest:[/interact|pick|open/i,/crouch/i,/idle/i], mantle:[/climb|mantle|vault/i,/jump/i]};
+function driveModel(s, hs, dt) {
+  if (!avatarModel) return;
+  let clip = null, dedicated = false;
+  (ANIM[s] || ANIM.idle).forEach((re, i) => { if (!clip) { clip = clips.find(c => re.test(c.name)); dedicated = i === 0 && !!clip; } });
+  clip = clip || clips.find(c => /idle/i.test(c.name)) || clips[0];
+  if (clip && mixer) {
+    const act = mixer.clipAction(clip);
+    if (act !== curAct) { act.reset().fadeIn(.2).play(); if (curAct) curAct.fadeOut(.2); curAct = act; }
+    act.timeScale = s === 'sprint' && !/sprint/i.test(clip.name) ? 1.3 : s === 'walk' && /run/i.test(clip.name) ? .6 : 1;
+  }
+  if (mixer) mixer.update(dt);
+  // procedural fallback when the pack has no dedicated clip
+  const k = 1 - Math.exp(-12*dt);
+  const tilt = !dedicated && s === 'slide' ? -.9 : !dedicated && s === 'chest' ? .45 : 0;
+  const sq = !dedicated && (s === 'crouch' || s === 'crouchwalk') ? .8 : 1;
+  modelRoot.rotation.x += (tilt - modelRoot.rotation.x) * k; modelRoot.scale.y += (sq - modelRoot.scale.y) * k;
+}
 const startEl = document.getElementById('start');
 startEl.addEventListener('click', () => renderer.domElement.requestPointerLock());
 document.addEventListener('pointerlockchange', () => {
   locked = document.pointerLockElement === renderer.domElement;
-  startEl.style.display = locked ? 'none' : 'flex';
+  startEl.style.display = (started && !locked) ? 'flex' : 'none';
+});
+AVATARS.forEach(a => {
+  const d = document.createElement('div'); d.className = 'card';
+  d.innerHTML = `<div class="sw" style="background:#${a.shirt.toString(16).padStart(6,'0')}"></div><b>${a.name}</b><span>${a.tag}</span>`;
+  d.onclick = () => { setAvatar(a); started = true; document.getElementById('select').style.display = 'none'; renderer.domElement.requestPointerLock(); };
+  document.getElementById('cards').appendChild(d);
 });
 addEventListener('mousemove', e => {
   if (!locked) return;
@@ -214,7 +289,15 @@ function update(dt) {
   crouchP = false;
 
   // jump
-  if (jumpP && P.grounded && !busy) { P.vel.y = T.jump; P.grounded = false; if (P.sliding) endSlide(); }
+  if (jumpP && !busy && !P.mantle) {
+    const mv = findMantle();
+    if (mv) {  // Space near a wall: mantle up onto it
+      const b = mv.b, tx = Math.min(b.x+b.hx-.3, Math.max(b.x-b.hx+.3, P.pos.x + mv.fx*1.15));
+      const tz = Math.min(b.z+b.hz-.3, Math.max(b.z-b.hz+.3, P.pos.z + mv.fz*1.15));
+      P.mantle = {t:0, from:P.pos.clone(), to:new THREE.Vector3(tx, b.h, tz), face:Math.atan2(mv.fx, mv.fz), fx:mv.fx, fz:mv.fz};
+      if (P.sliding) endSlide(); P.crouch = false;
+    } else if (P.grounded) { P.vel.y = T.jump; P.grounded = false; if (P.sliding) endSlide(); }
+  }
   jumpP = false;
 
   // horizontal velocity
@@ -229,105 +312,7 @@ function update(dt) {
     P.vel.x += (dx*tgt - P.vel.x) * a; P.vel.z += (dz*tgt - P.vel.z) * a;
   }
   // gravity + move
-  P.vel.y -= T.gravity * dt;
-  P.pos.addScaledVector(P.vel, dt);
-  if (P.pos.y <= 0) { P.pos.y = 0; P.vel.y = 0; P.grounded = true; } else P.grounded = false;
-  for (const c of colliders) {
-    const ox = P.pos.x - c.x, oz = P.pos.z - c.z, d = Math.hypot(ox, oz), m = c.r + .4;
-    if (d < m && d > 0.001) { P.pos.x = c.x + ox/d*m; P.pos.z = c.z + oz/d*m; if (P.sliding) endSlide(); }
-  }
-
-  // facing: sprint/slide/air face travel direction, otherwise face the camera (like a shooter)
-  let ft = camYaw;
-  const hs = Math.hypot(P.vel.x, P.vel.z);
-  if (P.sliding) ft = Math.atan2(P.slideDir.x, P.slideDir.y);
-  else if ((sprint || (!P.grounded && hs > 4)) && hs > .5) ft = Math.atan2(P.vel.x, P.vel.z);
-  if (busy && P.chest) ft = Math.atan2(P.chest.x - P.pos.x, P.chest.z - P.pos.z);
-  P.face = lerpAng(P.face, ft, 1 - Math.exp(-14*dt));
-
-  // state
-  let s;
-  if (busy) s = 'chest';
-  else if (P.sliding) s = 'slide';
-  else if (!P.grounded) s = P.vel.y > 0 ? 'jump' : 'fall';
-  else if (P.crouch) s = hs > .5 ? 'crouchwalk' : 'crouch';
-  else if (hs < .3) s = 'idle';
-  else if (sprint) s = 'sprint';
-  else if (keys.KeyZ) s = 'walk';
-  else s = 'run';
-  P.state = s;
-
-  // gait phase (sign from local forward velocity so backpedalling reverses the cycle)
-  const lf = P.vel.x*Math.sin(P.face) + P.vel.z*Math.cos(P.face);
-  const rate = { walk:1.7, run:1.5, sprint:1.35, crouchwalk:1.9 }[s];
-  if (rate && P.grounded) P.ph += dt * hs * rate * (lf >= -.2 ? 1 : -1);
-  const ph = P.ph, sn = Math.sin(ph), sn2 = Math.sin(ph+Math.PI);
-  const T0 = {hipY:.95, pitch:0, lean:.03+Math.sin(time*2)*.01, tL:0, tR:0, kL:0, kR:0, aL:.05, aR:.05, eL:-.15, eR:-.15, armZ:.06};
-  const gait = (amp, knee, arm, elbow, lean, bob, hipBase = .95) => {
-    T0.tL = sn*amp; T0.tR = sn2*amp;
-    T0.kL = Math.max(0,-Math.cos(ph))*knee + .1; T0.kR = Math.max(0,-Math.cos(ph+Math.PI))*knee + .1;
-    T0.aL = -sn*arm; T0.aR = -sn2*arm; T0.eL = T0.eR = -elbow; T0.lean = lean;
-    T0.hipY = hipBase - Math.abs(Math.cos(ph))*bob;
-  };
-  if (s === 'walk') gait(.5, .6, .4, .25, .05, .03);
-  else if (s === 'run') gait(.85, 1.3, .8, .9, .18, .05);
-  else if (s === 'sprint') gait(1.05, 1.7, 1.0, 1.4, .38, .06);
-  else if (s === 'crouch') Object.assign(T0, {hipY:.6, lean:.4, tL:-1.15, tR:-1.15, kL:1.75, kR:1.75, aL:-.5, aR:-.5, eL:-.9, eR:-.9});
-  else if (s === 'crouchwalk') { gait(.4, .5, .3, .5, .4, .02, .6); T0.tL -= 1.1; T0.tR -= 1.1; T0.kL += 1.6; T0.kR += 1.6; T0.aL -= .4; T0.aR -= .4; }
-  else if (s === 'slide') Object.assign(T0, {hipY:.42, pitch:-1.05, lean:.75, tL:-.15, tR:-.35, kL:.15, kR:.35, aL:.6, aR:.35, eL:-.4, eR:-.4, armZ:.5});
-  else if (s === 'jump') Object.assign(T0, {hipY:.95, lean:.1, tL:-.7, tR:.35, kL:1.2, kR:.8, aL:-1.5, aR:-1.2, eL:-.5, eR:-.4, armZ:.3});
-  else if (s === 'fall') Object.assign(T0, {hipY:.95, lean:.05, tL:-.3, tR:.25, kL:.5, kR:.3, aL:-.4, aR:-.4, eL:-.3, eR:-.3, armZ:1.0});
-  else if (s === 'chest') { const w = Math.sin(time*14)*.1;
-    Object.assign(T0, {hipY:.78, lean:.55, tL:-.45, tR:-.45, kL:.9, kR:.9, aL:-1.2+w, aR:-1.2-w, eL:-.4, eR:-.4}); }
-  const k = 1 - Math.exp(-(s==='run'||s==='sprint'||s==='walk' ? 26 : 14) * dt);
-  for (const key in pose) pose[key] += (T0[key] - pose[key]) * k;
-
-  // apply pose
-  hero.position.copy(P.pos); body.rotation.y = P.face;
-  hips.position.y = pose.hipY; hips.rotation.x = pose.pitch; torso.rotation.x = pose.lean;
-  legL.hp.rotation.x = pose.tL; legR.hp.rotation.x = pose.tR; legL.kn.rotation.x = pose.kL; legR.kn.rotation.x = pose.kR;
-  armL.sh.rotation.x = pose.aL; armR.sh.rotation.x = pose.aR; armL.el.rotation.x = pose.eL; armR.el.rotation.x = pose.eR;
-  armL.sh.rotation.z = pose.armZ; armR.sh.rotation.z = -pose.armZ;
-
-  // chest + loot animation
-  for (const c of chests) {
-    const tgt = c.opened ? 1.9 : (c === P.chest ? P.prog*.5 : 0);
-    c.lidPivot.rotation.x += (-tgt - c.lidPivot.rotation.x) * (1 - Math.exp(-10*dt));
-    c.beam.visible = !c.opened; c.light.intensity += ((c.opened ? .8 : 1.6) - c.light.intensity) * .1;
-  }
-  for (let i = loot.length-1; i >= 0; i--) {
-    const l = loot[i]; l.life -= dt;
-    if (!l.rest) { l.vy -= 14*dt; l.m.position.x += l.vx*dt; l.m.position.z += l.vz*dt; l.m.position.y += l.vy*dt;
-      if (l.m.position.y < .5) { l.m.position.y = .5; l.rest = true; } }
-    else l.m.position.y = .5 + Math.sin(time*3 + i)*.08;
-    l.m.rotation.y += dt*2.5;
-    l.m.scale.setScalar(Math.max(.01, Math.min(1, l.life)));
-    if (l.life <= 0) { scene.remove(l.m); loot.splice(i,1); }
-  }
-
-  // HUD
-  stateEl.textContent = s;
-  const showPrompt = near && !near.opened;
-  promptEl.style.display = showPrompt ? 'block' : 'none'; barEl.style.width = (P.prog*100) + '%';
-
-  // camera (over-the-shoulder, dips on crouch/slide, FOV kick on sprint/slide)
-  const targetFov = s === 'slide' ? 82 : s === 'sprint' ? 78 : 70;
-  fov += (targetFov - fov) * (1 - Math.exp(-6*dt)); cam.fov = fov; cam.updateProjectionMatrix();
-  const ch = pose.hipY + .75;
-  const look = new THREE.Vector3(Math.sin(camYaw)*Math.cos(camPitch), -Math.sin(camPitch), Math.cos(camYaw)*Math.cos(camPitch));
-  const tgt = new THREE.Vector3(P.pos.x + rx*TUNING.camShoulder, P.pos.y + ch, P.pos.z + rz*TUNING.camShoulder);
-  cam.position.copy(tgt).addScaledVector(look, -TUNING.camDist);
-  cam.position.y = Math.max(.3, cam.position.y);
-  cam.lookAt(tgt.x + look.x*5, tgt.y + look.y*5, tgt.z + look.z*5);
-
-  sun.position.set(P.pos.x + 20, 40, P.pos.z + 10); sun.target.position.copy(P.pos);
-}
-
-let last = performance.now();
-(function loop(now) {
-  const dt = Math.min(.05, (now - last)/1000); last = now;
-  update(dt); renderer.render(scene, cam); requestAnimationFrame(loop);
-})(last);
-</script>
-</body>
-</html>
+  if (P.mantle) {
+    const m = P.mantle, ez = x => x*x*(3-2*x); m.t += dt/.6; const u = Math.min(1, m.t);
+    const up = ez(Math.min(1, u/.6)), fw = ez(Math.max(0, (u-.5)/.5));
+    P.pos.set(m.from.x + (m.to.x-m.f
